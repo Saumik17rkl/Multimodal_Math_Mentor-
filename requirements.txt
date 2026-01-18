@@ -40,3 +40,5 @@ PyPDF2>=3.0.0
 python-json-logger>=2.0.7
 tqdm>=4.66.1
 python-multipart>=0.0.6
+sentence-transformers>=2.2.0
+whisper>=1.1.10
