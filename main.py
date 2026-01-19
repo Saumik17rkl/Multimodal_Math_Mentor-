@@ -19,7 +19,9 @@ from hitl import init_hitl_fields, save_hitl_review
 from dotenv import load_dotenv
 load_dotenv()
 
-# ---------------- ENV VALIDATION ----------------
+# =========================================================
+# ENV VALIDATION (NON-FATAL)
+# =========================================================
 REQUIRED_VARS = [
     "GROQ_API_KEY",
     "GEMINI_API_KEY",
@@ -27,11 +29,13 @@ REQUIRED_VARS = [
     "MONGODB_URI",
     "GROQ_MODEL",
     "GEMINI_MODEL",
-    "OPENAI_MODEL"
+    "OPENAI_MODEL",
 ]
+
 missing = [v for v in REQUIRED_VARS if not os.getenv(v)]
 if missing:
-    raise RuntimeError(f"Missing env vars: {missing}")
+    print(f"[WARNING] Missing env vars at startup: {missing}")
+
 SYSTEM_PROMPT = """You are an expert JEE (Joint Entrance Examination) Advanced mathematics problem solver with deep knowledge of calculus, algebra, coordinate geometry, trigonometry, vectors, and probability.
 
 CORE PRINCIPLES:
@@ -138,21 +142,32 @@ Any output that includes analysis sections, verification text, or meta commentar
 
 
 """
-
-# ---------------- CLIENTS ----------------
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# =========================================================
+# MODEL CLIENTS (SAFE INIT)
+# =========================================================
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
+genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")) if os.getenv("GEMINI_API_KEY") else None
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 
 GROQ_MODEL = os.getenv("GROQ_MODEL")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL")
 
-mongo = MongoClient(os.getenv("MONGODB_URI"))
-db = mongo["jee_solver"]
-solutions_col = db["solutions"]
+# =========================================================
+# LAZY MONGODB ACCESS (NO BOOT FAILURE)
+# =========================================================
+def get_solutions_collection():
+    uri = os.getenv("MONGODB_URI")
+    if not uri:
+        raise HTTPException(500, "MongoDB URI not configured")
 
-# ---------------- FASTAPI APP ----------------
+    client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+    db = client["jee_solver"]
+    return db["solutions"]
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
 app = FastAPI(title="JEE Math Solver API")
 
 app.add_middleware(
@@ -162,17 +177,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- LLM FUNCTIONS ----------------
+# =========================================================
+# LLM SOLVERS
+# =========================================================
 def solve_with_groq_rag_safe(question: str):
+    if not groq_client:
+        return None
     try:
         prompt = build_rag_prompt(question)
         resp = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.15
+            temperature=0.15,
         )
         return resp.choices[0].message.content
     except Exception:
@@ -180,11 +199,13 @@ def solve_with_groq_rag_safe(question: str):
 
 
 def solve_with_gemini_rag(question: str):
+    if not genai_client:
+        return None
     try:
         prompt = build_rag_prompt(question)
         resp = genai_client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=SYSTEM_PROMPT + "\n\n" + prompt
+            contents=SYSTEM_PROMPT + "\n\n" + prompt,
         )
         return resp.text
     except ClientError:
@@ -192,15 +213,17 @@ def solve_with_gemini_rag(question: str):
 
 
 def solve_with_openai_rag(question: str):
+    if not openai_client:
+        return None
     try:
         prompt = build_rag_prompt(question)
         resp = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.2
+            temperature=0.2,
         )
         return resp.choices[0].message.content
     except Exception:
@@ -214,13 +237,13 @@ def is_acceptable_answer(ans: Optional[str]) -> bool:
         "cannot solve",
         "unable to solve",
         "outside scope",
-        "cannot determine"
+        "cannot determine",
     ]
-    text = ans.lower()
-    return not any(b in text for b in bad)
+    return not any(b in ans.lower() for b in bad)
 
-
-# ---------------- CORE SOLVE PIPELINE ----------------
+# =========================================================
+# CORE PIPELINE
+# =========================================================
 def solve_question(question: str):
     memory_hit = retrieve_memory(question)
     if memory_hit:
@@ -240,46 +263,45 @@ def solve_question(question: str):
     if not sol:
         raise HTTPException(400, "All models failed")
 
-    solutions_col.insert_one({
-        "question": question,
-        "solution": sol,
-        "model_used": model,
-        "timestamp": datetime.utcnow(),
-        **init_hitl_fields()
-    })
+    col = get_solutions_collection()
+    col.insert_one(
+        {
+            "question": question,
+            "solution": sol,
+            "model_used": model,
+            "timestamp": datetime.utcnow(),
+            **init_hitl_fields(),
+        }
+    )
 
     return sol, model
 
-
-# ---------------- API ENDPOINTS ----------------
-
+# =========================================================
+# API ENDPOINTS
+# =========================================================
 @app.get("/")
-def main():
-    return{"The application is working"}
+def root():
+    return {"status": "Application is running"}
 
 @app.post("/solve/text")
 async def solve_text(question: str = Form(...)):
     solution, model = solve_question(question)
     return {"question": question, "solution": solution, "model": model}
 
-
 @app.post("/solve/image")
 async def solve_image(file: UploadFile = File(...)):
     text = extract_text_from_image(file.file)
     return {"extracted_text": text}
-
 
 @app.post("/solve/audio")
 async def solve_audio(file: UploadFile = File(...)):
     text = extract_text_from_audio(await file.read())
     return {"extracted_text": text}
 
-
 @app.post("/solve/confirm")
 async def solve_confirm(question: str = Form(...)):
     solution, model = solve_question(question)
     return {"solution": solution, "model": model}
-
 
 @app.post("/hitl/review")
 async def hitl_review(
@@ -287,15 +309,17 @@ async def hitl_review(
     solution: str = Form(...),
     decision: str = Form(...),
     feedback: str = Form(""),
-    corrected_solution: Optional[str] = Form(None)
+    corrected_solution: Optional[str] = Form(None),
 ):
+    col = get_solutions_collection()
+
     save_hitl_review(
-        collection=solutions_col,
+        collection=col,
         question=question,
         original_solution=solution,
         decision=decision,
         feedback=feedback,
-        corrected_solution=corrected_solution
+        corrected_solution=corrected_solution,
     )
 
     if decision in ["Approve", "Edit & Approve"]:
@@ -305,10 +329,14 @@ async def hitl_review(
             solution=final,
             concept="JEE Mathematics",
             approved=True,
-            source="human"
+            source="human",
         )
 
     return {"status": "saved"}
+
+# =========================================================
+# LOCAL DEV ONLY
+# =========================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
